@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""
+This program forecasts GTA VI's launch-day Twitch viewers for hours 2 to 24.
+It anchors on the known hour-1 viewers and pools past launches whose unlock text mentions midnight local or rolling.
+For each hour it fits an ordinary least-squares regression of log hour-h viewers on log hour-1 viewers across the pool, takes the fitted value at the case's hour-1 count as the median, and spreads the five quantiles by the population standard deviation of the regression residuals.
+Hours with fewer than 3 usable pool members fall back to a median log-ratio, and hours with none fall back to the starter baseline formula.
+The program is deterministic and uses only the standard library.
+"""
 import os
 import json
 import math
@@ -146,39 +153,56 @@ def compute_forecast(case):
 
     for h in range(2, 25):
         q_list = []
-        if len(kept_members) == 0:
+        xs = []
+        ys = []
+        for hm in kept_members:
+            if 1 in hm and h in hm:
+                xs.append(math.log(hm[1]))
+                ys.append(math.log(hm[h]))
+        n_both = len(xs)
+
+        if len(kept_members) == 0 or n_both == 0:
             for tau, z in Z_LEVELS:
                 val = p * math.exp(z * 0.15 * math.sqrt(h - 1))
                 val = max(1.0, min(1000000000.0, val))
                 q_list.append(val)
-        else:
-            log_ratios = []
-            for hm in kept_members:
-                if 1 in hm and h in hm:
-                    r = hm[h] / hm[1]
-                    if r > 0:
-                        log_ratios.append(math.log(r))
-
-            if len(log_ratios) == 0:
-                for tau, z in Z_LEVELS:
-                    val = p * math.exp(z * 0.15 * math.sqrt(h - 1))
-                    val = max(1.0, min(1000000000.0, val))
-                    q_list.append(val)
+        elif n_both < 3:
+            log_ratios = [ys[i] - xs[i] for i in range(n_both)]
+            sorted_lr = sorted(log_ratios)
+            n_lr = len(sorted_lr)
+            if n_lr % 2 == 1:
+                m = sorted_lr[n_lr // 2]
             else:
-                sorted_lr = sorted(log_ratios)
-                n_lr = len(sorted_lr)
-                if n_lr % 2 == 1:
-                    m = sorted_lr[n_lr // 2]
-                else:
-                    m = 0.5 * (sorted_lr[n_lr // 2 - 1] + sorted_lr[n_lr // 2])
+                m = 0.5 * (sorted_lr[n_lr // 2 - 1] + sorted_lr[n_lr // 2])
 
-                mean_sq_dev = sum((lr - m) ** 2 for lr in sorted_lr) / n_lr
-                s = math.sqrt(mean_sq_dev)
+            mean_sq_dev = sum((lr - m) ** 2 for lr in sorted_lr) / n_lr
+            s = math.sqrt(mean_sq_dev)
 
-                for tau, z in Z_LEVELS:
-                    val = p * math.exp(m + z * s)
-                    val = max(1.0, min(1000000000.0, val))
-                    q_list.append(val)
+            for tau, z in Z_LEVELS:
+                val = p * math.exp(m + z * s)
+                val = max(1.0, min(1000000000.0, val))
+                q_list.append(val)
+        else:
+            mean_x = sum(xs) / n_both
+            mean_y = sum(ys) / n_both
+            s_xx = sum((x - mean_x) ** 2 for x in xs)
+            if s_xx == 0 or abs(s_xx) < 1e-12:
+                b = 0.0
+                a = mean_y
+            else:
+                s_xy = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(n_both))
+                b = s_xy / s_xx
+                a = mean_y - b * mean_x
+
+            median_forecast = math.exp(a + b * math.log(p))
+            residuals = [ys[i] - (a + b * xs[i]) for i in range(n_both)]
+            mean_sq_res = sum(e ** 2 for e in residuals) / n_both
+            s = math.sqrt(mean_sq_res)
+
+            for tau, z in Z_LEVELS:
+                val = median_forecast * math.exp(z * s)
+                val = max(1.0, min(1000000000.0, val))
+                q_list.append(val)
 
         for i in range(1, len(q_list)):
             if q_list[i] < q_list[i - 1]:

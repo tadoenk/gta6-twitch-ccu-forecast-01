@@ -1,278 +1,326 @@
 #!/usr/bin/env python3
 """
-This program forecasts GTA VI's launch-day Twitch viewers for hours 2 to 24.
-It anchors on the known hour-1 viewers and pools past launches whose unlock text mentions midnight local or rolling.
-For each hour it fits an ordinary least-squares regression of log hour-h viewers on log hour-1 viewers across the pool, takes the fitted value at the case's hour-1 count as the median, and spreads the five quantiles by the population standard deviation of the regression residuals.
-Hours with fewer than 3 usable pool members fall back to a median log-ratio, and hours with none fall back to the starter baseline formula.
-The program is deterministic and uses only the standard library.
+GTA6 Twitch CCU Forecast program.
+Deterministic program forecasting launch-day viewers (hours 2 to 24) using anchor points,
+comparable pool filtering, OLS regression, and Huber Iteratively Reweighted Least Squares (IRLS)
+refinement. The Huber IRLS procedure iteratively reweights residuals (using weight 1 when
+absolute residual <= 1.5*s, and 1.5*s/|e_i| otherwise, with s as the root mean square deviation
+divided by n) over up to two iterations, stopping early if residual spread s <= 1e-12,
+to produce robust median forecasts and residual spreads unaffected by outliers.
+
+Fallback rules:
+- Starter baseline formula applies when there are no usable members (n = 0) or when the case cannot be parsed / is not a JSON object.
+- Median log-ratio method applies when there are 1 or 2 usable members (n = 1 or n = 2).
 """
+
 import os
+import glob
 import json
 import math
-import glob
 
-Z_LEVELS = [
-    (0.05, -1.644854),
-    (0.25, -0.674490),
-    (0.50, 0.0),
-    (0.75, 0.674490),
-    (0.95, 1.644854)
-]
+Z_VALS = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]
+TAU_VALS = [0.05, 0.25, 0.50, 0.75, 0.95]
 
-def parse_hour(ts):
-    if not ts or not isinstance(ts, str):
-        return None
-    try:
-        if len(ts) >= 13 and ts[10] in ('T', ' '):
-            return int(ts[11:13])
-        parts = ts.replace('T', ' ').split()
-        if len(parts) > 1:
-            time_part = parts[1]
-            hour_str = time_part.split(':')[0]
-            return int(hour_str)
-    except Exception:
-        pass
+def median(lst):
+    if not lst:
+        return 0.0
+    s = sorted(lst)
+    n = len(s)
+    mid = n // 2
+    if n % 2 == 1:
+        return s[mid]
+    else:
+        return (s[mid - 1] + s[mid]) / 2.0
+
+def get_viewers(item):
+    if isinstance(item, (int, float)):
+        return float(item)
+    if isinstance(item, dict):
+        for k in ["viewers", "viewers_count"]:
+            if k in item and item[k] is not None:
+                try:
+                    v = float(item[k])
+                    if not math.isnan(v) and not math.isinf(v):
+                        return v
+                except (ValueError, TypeError):
+                    pass
     return None
 
-def compute_forecast(case):
-    # Anchor p
-    p = 1.0
-    try:
-        known = case.get('known')
-        if isinstance(known, list) and len(known) > 0:
-            k0 = known[0]
-            if isinstance(k0, dict):
-                v = k0.get('viewers') or k0.get('viewers_count')
-                if v is not None:
-                    p = float(v)
-            elif isinstance(k0, (int, float)):
-                p = float(k0)
-        elif isinstance(known, dict):
-            v = known.get('viewers') or known.get('viewers_count')
-            if v is not None:
-                p = float(v)
-        
-        if p <= 0:
-            history_hourly = case.get('history_hourly')
-            if isinstance(history_hourly, list) and len(history_hourly) > 0:
-                last_h = history_hourly[-1]
-                if isinstance(last_h, dict):
-                    v = last_h.get('viewers') or last_h.get('viewers_count')
-                    if v is not None:
-                        p = float(v)
-    except Exception:
-        p = 1.0
+def extract_anchor(case):
+    # 1. Check "known" - if list, use LAST element
+    known = case.get("known")
+    if isinstance(known, list) and len(known) > 0:
+        v = get_viewers(known[-1])
+        if v is not None and v > 0:
+            return v
+    elif isinstance(known, dict):
+        v = get_viewers(known)
+        if v is not None and v > 0:
+            return v
 
+    # 2. Check last entry of "history_hourly"
+    history = case.get("history_hourly")
+    if isinstance(history, list) and len(history) > 0:
+        v = get_viewers(history[-1])
+        if v is not None and v > 0:
+            return v
+
+    # 3. Fallback
+    return 1.0
+
+def get_game_name(case):
+    game = case.get("game")
+    if isinstance(game, dict):
+        return str(game.get("name", "")).strip().lower()
+    elif isinstance(game, str):
+        return game.strip().lower()
+    return ""
+
+def get_unlock_text(comp):
+    for field in ["unlock", "unlock_description", "unlock_text", "description"]:
+        val = comp.get(field)
+        if isinstance(val, str) and val.strip():
+            return val.strip().lower()
+    return ""
+
+def baseline_forecast(p, h):
+    # q_tau = p * exp(z_tau * 0.15 * sqrt(h - 1))
+    res = []
+    for z in Z_VALS:
+        val = p * math.exp(z * 0.15 * math.sqrt(h - 1))
+        val = max(1.0, min(1000000000.0, val))
+        res.append(val)
+    # Enforce non-decreasing
+    res.sort()
+    return res
+
+def process_case(case):
+    p = extract_anchor(case)
     if p <= 0 or math.isnan(p) or math.isinf(p):
         p = 1.0
 
-    game_obj = case.get('game', {})
-    game_name = ""
-    if isinstance(game_obj, dict):
-        game_name = str(game_obj.get('name', ''))
-    elif isinstance(game_obj, str):
-        game_name = game_obj
-
-    comparables = case.get('comparables', [])
+    own_game = get_game_name(case)
+    comparables = case.get("comparables", [])
     if not isinstance(comparables, list):
         comparables = []
 
-    def get_unlock_text(comp):
-        for key in ['unlock', 'unlock_description', 'unlock_text', 'description']:
-            val = comp.get(key)
-            if val:
-                return str(val)
-        return ''
-
-    def get_platforms(comp):
-        pform = comp.get('platforms') or comp.get('platform') or []
-        if isinstance(pform, list):
-            return " ".join(str(x) for x in pform)
-        return str(pform)
-
-    filtered_pool = []
+    # Filter out own game
+    pool = []
     for comp in comparables:
         if not isinstance(comp, dict):
             continue
-        c_name = str(comp.get('name', ''))
-        if c_name.lower() == game_name.lower():
+        c_name = ""
+        c_game = comp.get("game")
+        if isinstance(c_game, dict):
+            c_name = str(c_game.get("name", "")).strip().lower()
+        elif isinstance(c_game, str):
+            c_name = c_game.strip().lower()
+        if not c_name:
+            c_name = str(comp.get("name", "")).strip().lower()
+        
+        if own_game and c_name == own_game:
             continue
-        unlock_lower = get_unlock_text(comp).lower()
+        pool.append(comp)
 
-        has_unlock = ("midnight local" in unlock_lower) or ("rolling" in unlock_lower)
-
-        if has_unlock:
+    # Filter by unlock text mentions "midnight local" or "rolling"
+    filtered_pool = []
+    for comp in pool:
+        ut = get_unlock_text(comp)
+        if "midnight local" in ut or "rolling" in ut:
             filtered_pool.append(comp)
 
-    pool = filtered_pool
-    if len(pool) < 6:
-        pool = []
-        for comp in comparables:
-            if not isinstance(comp, dict):
-                continue
-            c_name = str(comp.get('name', ''))
-            if c_name.lower() == game_name.lower():
-                continue
-            pool.append(comp)
+    if len(filtered_pool) < 6:
+        # use all comparables except own game
+        filtered_pool = pool
 
+    # Kept members
     kept_members = []
-    for comp in pool:
-        day_start = str(comp.get('day_start', ''))
-        if len(day_start) < 10:
+    for comp in filtered_pool:
+        day_start = str(comp.get("day_start", ""))[:10]
+        hourly_data = comp.get("hourly") or comp.get("hourly_points") or comp.get("points")
+        if not isinstance(hourly_data, list):
             continue
-        date_part = day_start[:10]
-
-        hourly_pts = comp.get('hourly') or comp.get('hourly_points') or comp.get('points') or []
-        if not isinstance(hourly_pts, list):
-            continue
-
-        hour_map = {}
-        for pt in hourly_pts:
+        
+        hours_dict = {}
+        for pt in hourly_data:
             if not isinstance(pt, dict):
                 continue
-            from_ts = str(pt.get('from') or pt.get('from_timestamp') or pt.get('timestamp') or '')
-            if len(from_ts) < 10 or from_ts[:10] != date_part:
+            # Read timestamp from 'from' field (or fallback to 'timestamp')
+            ts_val = pt.get("from")
+            if not ts_val:
+                ts_val = pt.get("timestamp", "")
+            ts = str(ts_val)
+            if len(ts) < 10:
                 continue
-            viewers = pt.get('viewers') or pt.get('viewers_count')
-            if viewers is None:
+            t_date = ts[:10]
+            if t_date != day_start:
                 continue
-            try:
-                v_float = float(viewers)
-            except Exception:
-                continue
-            h_num = parse_hour(from_ts)
-            if h_num is not None:
-                hour_num = h_num + 1
-                if 1 <= hour_num <= 24:
-                    hour_map[hour_num] = max(1.0, v_float)
+            
+            hour_val = None
+            if "T" in ts:
+                time_part = ts.split("T")[1]
+                try:
+                    h_part = int(time_part[:2])
+                    hour_val = h_part + 1
+                except:
+                    pass
+            if hour_val is None:
+                if "hour" in pt:
+                    try:
+                        hour_val = int(pt["hour"])
+                    except:
+                        pass
+            
+            if hour_val is not None and 1 <= hour_val <= 24:
+                v = get_viewers(pt)
+                if v is not None:
+                    v = max(1.0, v)
+                    hours_dict[hour_val] = v
 
-        if hour_map.get(1, 0) > 0 and len(hour_map) >= 20:
-            kept_members.append(hour_map)
+        if 1 in hours_dict and len(hours_dict) >= 20:
+            kept_members.append(hours_dict)
 
     hours_output = []
+    ln_p = math.log(p)
 
     for h in range(2, 25):
-        q_list = []
+        # Gather points (x = ln(hour-1 viewers), y = ln(hour-h viewers))
         xs = []
         ys = []
-        for hm in kept_members:
-            if 1 in hm and h in hm:
-                xs.append(math.log(hm[1]))
-                ys.append(math.log(hm[h]))
-        n_both = len(xs)
-
-        if len(kept_members) == 0 or n_both == 0:
-            for tau, z in Z_LEVELS:
-                val = p * math.exp(z * 0.15 * math.sqrt(h - 1))
+        for km in kept_members:
+            if 1 in km and h in km:
+                xs.append(math.log(km[1]))
+                ys.append(math.log(km[h]))
+        
+        n = len(xs)
+        if n == 0:
+            q_vals = baseline_forecast(p, h)
+        elif n in (1, 2):
+            ratios = [ys[i] - xs[i] for i in range(n)]
+            m = median(ratios)
+            var_sum = sum((r - m) ** 2 for r in ratios)
+            s = math.sqrt(var_sum / n)
+            q_vals = []
+            median_val = p * math.exp(m)
+            for z in Z_VALS:
+                val = median_val * math.exp(z * s)
                 val = max(1.0, min(1000000000.0, val))
-                q_list.append(val)
-        elif n_both < 3:
-            log_ratios = [ys[i] - xs[i] for i in range(n_both)]
-            sorted_lr = sorted(log_ratios)
-            n_lr = len(sorted_lr)
-            if n_lr % 2 == 1:
-                m = sorted_lr[n_lr // 2]
-            else:
-                m = 0.5 * (sorted_lr[n_lr // 2 - 1] + sorted_lr[n_lr // 2])
-
-            mean_sq_dev = sum((lr - m) ** 2 for lr in sorted_lr) / n_lr
-            s = math.sqrt(mean_sq_dev)
-
-            for tau, z in Z_LEVELS:
-                val = p * math.exp(m + z * s)
-                val = max(1.0, min(1000000000.0, val))
-                q_list.append(val)
+                q_vals.append(val)
+            q_vals.sort()
         else:
-            mean_x = sum(xs) / n_both
-            mean_y = sum(ys) / n_both
-            s_xx = sum((x - mean_x) ** 2 for x in xs)
-            if s_xx == 0 or abs(s_xx) < 1e-12:
+            # n >= 3: OLS then up to two Huber IRLS iterations
+            mean_x = sum(xs) / n
+            mean_y = sum(ys) / n
+            sxx = sum((x - mean_x) ** 2 for x in xs)
+            sxy = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(n))
+
+            if sxx < 1e-12:
                 b = 0.0
                 a = mean_y
             else:
-                s_xy = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(n_both))
-                b = s_xy / s_xx
+                b = sxy / sxx
                 a = mean_y - b * mean_x
 
-            median_forecast = math.exp(a + b * math.log(p))
-            residuals = [ys[i] - (a + b * xs[i]) for i in range(n_both)]
-            mean_sq_res = sum(e ** 2 for e in residuals) / n_both
-            s = math.sqrt(mean_sq_res)
+            # Huber IRLS refinement: at most two iterations, recomputing residuals and s at each step
+            for _ in range(2):
+                residuals = [ys[i] - (a + b * xs[i]) for i in range(n)]
+                var_e = sum(e ** 2 for e in residuals) / n
+                s = math.sqrt(var_e)
+                if s <= 1e-12:
+                    break
+                
+                weights = []
+                for e in residuals:
+                    abs_e = abs(e)
+                    if abs_e <= 1.5 * s:
+                        weights.append(1.0)
+                    else:
+                        weights.append(1.5 * s / abs_e)
 
-            for tau, z in Z_LEVELS:
-                val = median_forecast * math.exp(z * s)
+                sum_w = sum(weights)
+                if sum_w <= 1e-12:
+                    break
+                mean_xw = sum(weights[i] * xs[i] for i in range(n)) / sum_w
+                mean_yw = sum(weights[i] * ys[i] for i in range(n)) / sum_w
+
+                sxx_w = sum(weights[i] * (xs[i] - mean_xw) ** 2 for i in range(n))
+                sxy_w = sum(weights[i] * (xs[i] - mean_xw) * (ys[i] - mean_yw) for i in range(n))
+
+                if sxx_w < 1e-12:
+                    b = 0.0
+                    a = mean_yw
+                else:
+                    b = sxy_w / sxx_w
+                    a = mean_yw - b * mean_xw
+
+            # Final median forecast and residual spread recomputed from final residuals after loop
+            median_val = math.exp(a + b * ln_p)
+            final_residuals = [ys[i] - (a + b * xs[i]) for i in range(n)]
+            final_s = math.sqrt(sum(e ** 2 for e in final_residuals) / n)
+
+            q_vals = []
+            for z in Z_VALS:
+                val = median_val * math.exp(z * final_s)
                 val = max(1.0, min(1000000000.0, val))
-                q_list.append(val)
-
-        for i in range(1, len(q_list)):
-            if q_list[i] < q_list[i - 1]:
-                q_list[i] = q_list[i - 1]
+                q_vals.append(val)
+            q_vals.sort()
 
         hours_output.append({
             "hour": h,
-            "q": q_list
+            "q": [v for v in q_vals]  # Full float precision, no rounding
         })
 
-    return {"hours": hours_output}
-
-def fallback_forecast():
-    hours_output = []
-    p = 1.0
-    for h in range(2, 25):
-        q_list = []
-        for tau, z in Z_LEVELS:
-            val = p * math.exp(z * 0.15 * math.sqrt(h - 1))
-            val = max(1.0, min(1000000000.0, val))
-            q_list.append(val)
-        for i in range(1, len(q_list)):
-            if q_list[i] < q_list[i - 1]:
-                q_list[i] = q_list[i - 1]
-        hours_output.append({
-            "hour": h,
-            "q": q_list
-        })
     return {"hours": hours_output}
 
 def main():
-    input_dir = os.environ.get('MAKEFUN_INPUT_DIR', '/input')
-    output_dir = os.environ.get('MAKEFUN_OUTPUT_DIR', '/output')
-
-    if not os.path.exists(input_dir):
-        if os.path.exists('input'):
-            input_dir = 'input'
+    input_dir = os.environ.get("MAKEFUN_INPUT_DIR")
+    if not input_dir or not os.path.exists(input_dir):
+        if os.path.exists("/input"):
+            input_dir = "/input"
+        elif os.path.exists("./input"):
+            input_dir = "./input"
         else:
-            input_dir = '.'
+            input_dir = "."
 
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir, exist_ok=True)
+    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(output_dir, exist_ok=True)
 
-    in_files = sorted(glob.glob(os.path.join(input_dir, '*.in')))
-    if not in_files:
-        in_files = sorted(glob.glob('*.in'))
+    in_files = glob.glob(os.path.join(input_dir, "*.in"))
 
-    for filepath in in_files:
-        filename = os.path.basename(filepath)
-        case_id = os.path.splitext(filename)[0]
+    for in_path in in_files:
+        filename = os.path.basename(in_path)
+        stem = os.path.splitext(filename)[0]
+        
+        case_id = stem
+        parsed_ok = False
+        case_data = None
+
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
+            with open(in_path, "r", encoding="utf-8") as f:
                 case_data = json.load(f)
             if isinstance(case_data, dict):
-                if 'id' in case_data:
-                    case_id = str(case_data['id'])
-                result = compute_forecast(case_data)
-            else:
-                result = fallback_forecast()
+                parsed_ok = True
+                if "id" in case_data and case_data["id"] is not None:
+                    case_id = str(case_data["id"])
         except Exception:
-            result = fallback_forecast()
+            pass
 
-        out_filepath = os.path.join(output_dir, f"{case_id}.out")
-        try:
-            with open(out_filepath, 'w', encoding='utf-8') as f:
-                json.dump(result, f, separators=(',', ':'))
-        except Exception:
-            out_filepath = f"{case_id}.out"
-            with open(out_filepath, 'w', encoding='utf-8') as f:
-                json.dump(result, f, separators=(',', ':'))
+        if not parsed_ok or not isinstance(case_data, dict):
+            # Fallback forecast
+            hours_output = []
+            for h in range(2, 25):
+                q_vals = baseline_forecast(1.0, h)
+                hours_output.append({
+                    "hour": h,
+                    "q": [v for v in q_vals]
+                })
+            output_data = {"hours": hours_output}
+        else:
+            output_data = process_case(case_data)
 
-if __name__ == '__main__':
+        out_path = os.path.join(output_dir, f"{case_id}.out")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(output_data, f, separators=(',', ':'))
+
+if __name__ == "__main__":
     main()
